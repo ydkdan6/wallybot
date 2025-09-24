@@ -1,4 +1,4 @@
-const axios = require('axios');
+import axios from 'axios';
 
 class PaystackService {
   constructor(secretKey) {
@@ -124,4 +124,4 @@ class PaystackService {
   }
 }
 
-module.exports = PaystackService;
+export default PaystackService;

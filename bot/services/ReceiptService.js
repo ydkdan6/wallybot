@@ -111,4 +111,4 @@ class ReceiptService {
   }
 }
 
-module.exports = ReceiptService;
+export default ReceiptService;

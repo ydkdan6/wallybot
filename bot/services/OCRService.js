@@ -1,5 +1,5 @@
-const axios = require('axios');
-const FormData = require('form-data');
+import axios from 'axios';
+import FormData from 'form-data';
 
 class OCRService {
   constructor(apiKey) {
@@ -68,4 +68,4 @@ class OCRService {
   }
 }
 
-module.exports = OCRService;
+export default OCRService;

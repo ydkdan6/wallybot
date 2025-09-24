@@ -1,20 +1,25 @@
-const TelegramBot = require('node-telegram-bot-api');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-const { createClient } = require('@supabase/supabase-js');
-const axios = require('axios');
-const bcrypt = require('bcryptjs');
-const cron = require('node-cron');
-const crypto = require('crypto');
-const { v4: uuidv4 } = require('uuid');
-const fs = require('fs');
-const path = require('path');
+import TelegramBot from 'node-telegram-bot-api';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { createClient } from '@supabase/supabase-js';
+import axios from 'axios';
+import bcrypt from 'bcryptjs';
+import cron from 'node-cron';
+import crypto from 'crypto';
+import { v4 as uuidv4 } from 'uuid';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
-// Services
-const PaystackService = require('./services/PaystackService');
-const ReceiptService = require('./services/ReceiptService');
-const ReportService = require('./services/ReportService');
-const OCRService = require('./services/OCRService');
-const NLPService = require('./services/NLPService');
+// Get __dirname equivalent for ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Services - you'll need to convert these to ES modules too
+import PaystackService from './services/PaystackService.js';
+import ReceiptService from './services/ReceiptService.js';
+import ReportService from './services/ReportService.js';
+import OCRService from './services/OCRService.js';
+import NLPService from './services/NLPService.js';
 
 // Initialize services
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
@@ -51,7 +56,7 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
         // Create Paystack customer and virtual account
         await setupUserWallet(user);
         
-        await bot.sendMessage(chatId, `🎉 Welcome to SecurePay Wallet, ${user.first_name}!\n\n` +
+        await bot.sendMessage(chatId, `🎉 Welcome to QuickWallet, ${user.first_name}!\n\n` +
           `Your account has been successfully linked. I'm your AI-powered financial assistant.\n\n` +
           `✨ What I can help you with:\n` +
           `💰 Fund your wallet\n` +
@@ -67,10 +72,10 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
       }
     } else {
       await bot.sendMessage(chatId, 
-        `👋 Welcome to SecurePay Wallet!\n\n` +
+        `👋 Welcome to QuickWallet!\n\n` +
         `To get started, please create an account first at our registration portal.\n` +
         `After registration, you'll be automatically redirected here.\n\n` +
-        `🔗 Registration: [Create Account](https://your-app-url.com)`);
+        `🔗 Registration: [Create Account](https://quickwallet-gules.vercel.app)`);
     }
   } catch (error) {
     console.error('Start command error:', error);
@@ -128,7 +133,7 @@ bot.on('message', async (msg) => {
     if (!user) {
       await bot.sendMessage(chatId, 
         `❌ Please register first to use this service.\n` +
-        `🔗 Registration: [Create Account](https://your-app-url.com)`);
+        `🔗 Registration: [Create Account](https://quickwallet-gules.vercel.app)`);
       return;
     }
 
@@ -473,4 +478,4 @@ async function generateMonthlyReports() {
 
 console.log('🤖 Telegram bot started successfully!');
 
-module.exports = { bot, supabase };
+export { bot, supabase };

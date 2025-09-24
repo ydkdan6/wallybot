@@ -115,4 +115,4 @@ class NLPService {
   }
 }
 
-module.exports = NLPService;
+export default NLPService;

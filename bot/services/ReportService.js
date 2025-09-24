@@ -101,4 +101,4 @@ class ReportService {
   }
 }
 
-module.exports = ReportService;
+export default ReportService;
