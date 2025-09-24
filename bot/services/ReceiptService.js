@@ -1,6 +1,11 @@
-const fs = require('fs');
-const path = require('path');
-const PDFKit = require('pdfkit');
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import PDFKit from 'pdfkit';
+
+// Get __dirname equivalent for ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 class ReceiptService {
   constructor() {
@@ -70,7 +75,7 @@ class ReceiptService {
         yPosition += 30;
         doc.fontSize(12)
            .fillColor('#111827')
-           .text('Account Holder', 50, yPosition, { underline: true });
+           .text('User Details', 50, yPosition, { underline: true });
 
         yPosition += 30;
         const userDetails = [

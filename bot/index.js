@@ -1,3 +1,7 @@
+// Load environment variables
+import dotenv from 'dotenv';
+dotenv.config();
+
 import TelegramBot from 'node-telegram-bot-api';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createClient } from '@supabase/supabase-js';
@@ -20,6 +24,24 @@ import ReceiptService from './services/ReceiptService.js';
 import ReportService from './services/ReportService.js';
 import OCRService from './services/OCRService.js';
 import NLPService from './services/NLPService.js';
+
+// Validate environment variables
+const requiredEnvVars = [
+  'TELEGRAM_BOT_TOKEN',
+  'SUPABASE_URL',
+  'SUPABASE_SERVICE_ROLE_KEY',
+  'PAYSTACK_SECRET_KEY',
+  'GEMINI_API_KEY'
+];
+
+for (const envVar of requiredEnvVars) {
+  if (!process.env[envVar]) {
+    console.error(`❌ Missing required environment variable: ${envVar}`);
+    process.exit(1);
+  }
+}
+
+console.log('✅ All environment variables loaded successfully!');
 
 // Initialize services
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });

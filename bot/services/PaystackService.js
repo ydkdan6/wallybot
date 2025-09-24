@@ -29,13 +29,12 @@ class PaystackService {
     }
   }
 
-  async createDedicatedAccount(customerCode, preferredBank = 'wema-bank') {
+  async createDedicatedAccount(customerCode) {
     try {
       const response = await axios.post(
         `${this.baseURL}/dedicated_account`,
         {
-          customer: customerCode,
-          preferred_bank: preferredBank
+          customer: customerCode
         },
         { headers: this.headers }
       );
