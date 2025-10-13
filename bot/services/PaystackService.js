@@ -4,120 +4,146 @@ class PaystackService {
   constructor(secretKey) {
     this.secretKey = secretKey;
     this.baseURL = 'https://api.paystack.co';
-    this.headers = {
-      'Authorization': `Bearer ${secretKey}`,
-      'Content-Type': 'application/json'
-    };
   }
 
-  async createCustomer(customerData) {
+  /**
+   * Resolve account number to get account name
+   * @param {string} accountNumber - 10-digit account number
+   * @param {string} bankCode - Bank code (e.g., '070' for Fidelity)
+   * @returns {Promise<Object>} Account details
+   */
+  async resolveAccountNumber(accountNumber, bankCode) {
     try {
-      const response = await axios.post(
-        `${this.baseURL}/customer`,
-        customerData,
-        { headers: this.headers }
-      );
+      console.log(`🔍 Resolving account: ${accountNumber} at bank: ${bankCode}`);
       
-      if (response.data.status) {
-        return response.data.data;
-      } else {
-        throw new Error(response.data.message);
-      }
-    } catch (error) {
-      console.error('Create customer error:', error.response?.data || error.message);
-      throw error;
-    }
-  }
-
-  async createDedicatedAccount(customerCode) {
-    try {
-      const response = await axios.post(
-        `${this.baseURL}/dedicated_account`,
-        {
-          customer: customerCode
+      const response = await axios.get(`${this.baseURL}/bank/resolve`, {
+        params: {
+          account_number: accountNumber,
+          bank_code: bankCode
         },
-        { headers: this.headers }
-      );
+        headers: {
+          'Authorization': `Bearer ${this.secretKey}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 10000
+      });
+
+      console.log('✅ Account resolved successfully');
+      return response.data;
       
-      if (response.data.status) {
-        return response.data.data;
-      } else {
-        throw new Error(response.data.message);
-      }
     } catch (error) {
-      console.error('Create dedicated account error:', error.response?.data || error.message);
+      console.error('❌ Account resolution failed:', error.response?.data || error.message);
+      
+      // Return structured error
+      throw new Error(
+        error.response?.data?.message || 
+        'Failed to resolve account number'
+      );
+    }
+  }
+
+  /**
+   * List all banks
+   * @param {string} country - Country code (NG, GH, ZA)
+   * @returns {Promise<Array>} List of banks
+   */
+  async listBanks(country = 'NG') {
+    try {
+      const response = await axios.get(`${this.baseURL}/bank`, {
+        params: {
+          country,
+          perPage: 100
+        },
+        headers: {
+          'Authorization': `Bearer ${this.secretKey}`
+        },
+        timeout: 10000
+      });
+
+      return response.data;
+    } catch (error) {
+      console.error('❌ Failed to list banks:', error.message);
       throw error;
     }
   }
 
-  async verifyTransaction(reference) {
+  /**
+   * Validate account (for South Africa)
+   * @param {Object} accountData - Account validation data
+   * @returns {Promise<Object>} Validation result
+   */
+  async validateAccount(accountData) {
     try {
-      const response = await axios.get(
-        `${this.baseURL}/transaction/verify/${reference}`,
-        { headers: this.headers }
+      const response = await axios.post(
+        `${this.baseURL}/bank/validate`,
+        accountData,
+        {
+          headers: {
+            'Authorization': `Bearer ${this.secretKey}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: 10000
+        }
       );
-      
-      if (response.data.status) {
-        return response.data.data;
-      } else {
-        throw new Error(response.data.message);
-      }
+
+      return response.data;
     } catch (error) {
-      console.error('Verify transaction error:', error.response?.data || error.message);
+      console.error('❌ Account validation failed:', error.response?.data || error.message);
+      throw new Error(
+        error.response?.data?.message || 
+        'Failed to validate account'
+      );
+    }
+  }
+
+  /**
+   * Create transfer recipient
+   * @param {Object} recipientData - Recipient details
+   * @returns {Promise<Object>} Recipient creation result
+   */
+  async createTransferRecipient(recipientData) {
+    try {
+      const response = await axios.post(
+        `${this.baseURL}/transferrecipient`,
+        recipientData,
+        {
+          headers: {
+            'Authorization': `Bearer ${this.secretKey}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: 10000
+        }
+      );
+
+      return response.data;
+    } catch (error) {
+      console.error('❌ Failed to create recipient:', error.response?.data || error.message);
       throw error;
     }
   }
 
-  async listTransactions(customerCode) {
+  /**
+   * Initiate transfer
+   * @param {Object} transferData - Transfer details
+   * @returns {Promise<Object>} Transfer result
+   */
+  async initiateTransfer(transferData) {
     try {
-      const response = await axios.get(
-        `${this.baseURL}/transaction?customer=${customerCode}`,
-        { headers: this.headers }
+      const response = await axios.post(
+        `${this.baseURL}/transfer`,
+        transferData,
+        {
+          headers: {
+            'Authorization': `Bearer ${this.secretKey}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: 10000
+        }
       );
-      
-      if (response.data.status) {
-        return response.data.data;
-      } else {
-        throw new Error(response.data.message);
-      }
-    } catch (error) {
-      console.error('List transactions error:', error.response?.data || error.message);
-      throw error;
-    }
-  }
 
-  async getBankList() {
-    try {
-      const response = await axios.get(
-        `${this.baseURL}/bank`,
-        { headers: this.headers }
-      );
-      
-      if (response.data.status) {
-        return response.data.data;
-      } else {
-        throw new Error(response.data.message);
-      }
+      return response.data;
     } catch (error) {
-      console.error('Get bank list error:', error.response?.data || error.message);
-      throw error;
-    }
-  }
-
-  async resolveBankAccount(accountNumber, bankCode) {
-    try {
-      const response = await axios.get(
-        `${this.baseURL}/bank/resolve?account_number=${accountNumber}&bank_code=${bankCode}`,
-        { headers: this.headers }
-      );
-      
-      if (response.data.status) {
-        return response.data.data;
-      } else {
-        throw new Error(response.data.message);
-      }
-    } catch (error) {
-      console.error('Resolve bank account error:', error.response?.data || error.message);
+      console.error('❌ Transfer failed:', error.response?.data || error.message);
       throw error;
     }
   }
