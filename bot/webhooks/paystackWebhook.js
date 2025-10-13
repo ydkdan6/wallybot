@@ -1,88 +1,96 @@
 /**
- * Paystack Webhook Handler (Production-Ready - FIXED VERSION)
- *
- * ✅ Verifies Paystack signature with raw body
- * ✅ Handles charge.success, transfer.success, transfer.failed
- * ✅ Async background processing with retry mechanism
- * ✅ Atomic wallet updates via Supabase RPC
- * ✅ Telegram notifications with exponential backoff
- * ✅ Full audit logging with idempotency
- * ✅ Memory leak prevention
- * ✅ Timeout protection
+ * COMPLETE PAYSTACK WEBHOOK INTEGRATION
+ * 
+ * Webhook URL: https://quickwally.onrender.com/webhooks/paystack
+ * 
+ * Setup Instructions:
+ * 1. Add this URL to your Paystack Dashboard under Settings > Webhooks
+ * 2. Ensure PAYSTACK_SECRET_KEY is in your environment variables
+ * 3. Deploy to Render and test
  */
 
+import express from "express";
 import crypto from "crypto";
 
-// Telegram notification with retry and rate limit handling
-async function sendTelegramWithRetry(bot, chatId, message, options = {}, retries = 3) {
-  for (let i = 0; i < retries; i++) {
-    try {
-      return await bot.sendMessage(chatId, message, options);
-    } catch (err) {
-      if (err.response?.statusCode === 429) {
-        const retryAfter = err.response.parameters?.retry_after || (i + 1) * 2;
-        console.log(`⏳ Rate limited, retrying after ${retryAfter}s...`);
-        await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-      } else if (i === retries - 1) {
-        console.error("❌ Telegram notification failed:", err.message);
-        // Log but don't throw - notification failure shouldn't break webhook
-        return null;
-      } else {
-        // Exponential backoff for other errors
-        await new Promise(resolve => setTimeout(resolve, Math.pow(2, i) * 1000));
-      }
-    }
-  }
-}
+const app = express();
 
-export async function handlePaystackWebhook(req, res, supabase, bot, paystackService) {
+/**
+ * CRITICAL: Raw body parser for webhook signature verification
+ * Must come BEFORE express.json() middleware
+ */
+app.use('/webhooks/paystack', express.raw({ type: 'application/json' }));
+
+/**
+ * Standard JSON parser for other routes
+ */
+app.use(express.json());
+
+/**
+ * Paystack Webhook Endpoint
+ * URL: https://quickwally.onrender.com/webhooks/paystack
+ */
+app.post("/webhooks/paystack", async (req, res) => {
   const startTime = Date.now();
   
   try {
     const signature = req.headers["x-paystack-signature"];
     
-    // ✅ Use raw body for signature verification
-    const bodyString = req.rawBody || JSON.stringify(req.body);
+    // ✅ Get raw body for signature verification
+    const bodyString = req.body.toString('utf8');
+    const bodyJson = JSON.parse(bodyString);
 
-    // ✅ Verify webhook signature (except when replayed manually)
-    if (signature !== "REPLAY") {
-      const expectedHash = crypto
-        .createHmac("sha512", process.env.PAYSTACK_SECRET_KEY)
-        .update(bodyString)
-        .digest("hex");
-
-      if (expectedHash !== signature) {
-        console.error("❌ Invalid Paystack signature");
-        await logSecurityEvent(supabase, null, "INVALID_WEBHOOK_SIGNATURE", {
-          received_signature: signature,
-          expected_signature: expectedHash.substring(0, 16) + "...",
-          ip: req.ip
-        });
-        return res.status(400).send("Invalid signature");
-      }
+    // ✅ Verify webhook signature
+    if (!signature) {
+      console.error("❌ Missing Paystack signature");
+      return res.status(400).send("Missing signature");
     }
 
-    const event = req.body;
-    console.log(`📥 Received Paystack Event: ${event.event} | Ref: ${event.data?.reference || 'N/A'}`);
+    // ✅ Validate signature using raw body
+    const expectedHash = crypto
+      .createHmac("sha512", process.env.PAYSTACK_SECRET_KEY)
+      .update(bodyString)
+      .digest("hex");
 
-    // ✅ Respond immediately to avoid Paystack retries
-    res.status(200).send("Received");
+    if (expectedHash !== signature) {
+      console.error("❌ Invalid Paystack signature");
+      await logSecurityEvent(supabase, null, "INVALID_WEBHOOK_SIGNATURE", {
+        received_signature: signature.substring(0, 16) + "...",
+        ip: req.ip,
+        user_agent: req.headers['user-agent']
+      });
+      return res.status(400).send("Invalid signature");
+    }
+
+    console.log(`📥 Valid Paystack Event: ${bodyJson.event} | Ref: ${bodyJson.data?.reference || 'N/A'}`);
+
+    // ✅ Log webhook event for tracking
+    await supabase.from('webhook_events').insert([{
+      event_type: bodyJson.event,
+      reference: bodyJson.data?.reference || null,
+      payload: bodyJson,
+      processed: false,
+      received_at: new Date().toISOString()
+    }]);
+
+    // ✅ Respond immediately with 200 OK
+    res.status(200).send("OK");
 
     // ✅ Process in background with timeout protection
-    const WEBHOOK_TIMEOUT = 25000; // 25 seconds (Paystack timeout is 30s)
+    const WEBHOOK_TIMEOUT = 25000; // 25 seconds
     
     const timeoutPromise = new Promise((_, reject) => {
       setTimeout(() => reject(new Error('Webhook processing timeout')), WEBHOOK_TIMEOUT);
     });
 
-    process.nextTick(async () => {
+    // Process asynchronously
+    setImmediate(async () => {
       try {
         await Promise.race([
-          processPaystackEvent(event, supabase, bot, paystackService),
+          processPaystackEvent(bodyJson, supabase, bot, paystackService),
           timeoutPromise
         ]);
         
-        // ✅ Mark webhook as successfully processed
+        // Mark as processed
         await supabase
           .from('webhook_events')
           .update({ 
@@ -90,15 +98,14 @@ export async function handlePaystackWebhook(req, res, supabase, bot, paystackSer
             processed_at: new Date().toISOString(),
             processing_time_ms: Date.now() - startTime
           })
-          .eq('reference', event.data?.reference)
-          .eq('event_type', event.event);
+          .eq('reference', bodyJson.data?.reference)
+          .eq('event_type', bodyJson.event);
           
         console.log(`✅ Webhook processed in ${Date.now() - startTime}ms`);
         
       } catch (err) {
         console.error("❌ Async processing error:", err);
         
-        // ✅ Mark as failed for manual review with retry tracking
         await supabase
           .from('webhook_events')
           .update({ 
@@ -107,32 +114,35 @@ export async function handlePaystackWebhook(req, res, supabase, bot, paystackSer
             last_retry_at: new Date().toISOString(),
             processing_time_ms: Date.now() - startTime
           })
-          .eq('reference', event.data?.reference)
-          .eq('event_type', event.event);
-          
-        await logSecurityEvent(supabase, null, "WEBHOOK_PROCESSING_ERROR", { 
-          error: err.message,
-          event_type: event.event,
-          reference: event.data?.reference,
-          processing_time_ms: Date.now() - startTime
-        });
+          .eq('reference', bodyJson.data?.reference)
+          .eq('event_type', bodyJson.event);
       }
     });
+
   } catch (error) {
     console.error("❌ Webhook handling error:", error);
     
-    // Log critical errors
+    // Don't throw - already sent 200 OK
     await logSecurityEvent(supabase, null, "WEBHOOK_HANDLER_ERROR", {
       error: error.message,
       stack: error.stack
     }).catch(err => console.error("Failed to log error:", err));
-    
-    return res.status(500).send("Error");
   }
-}
+});
 
 /**
- * Handle various Paystack events
+ * Health check endpoint
+ */
+app.get("/webhooks/paystack", (req, res) => {
+  res.status(200).json({ 
+    status: "active",
+    webhook_url: "https://quickwally.onrender.com/webhooks/paystack",
+    message: "Paystack webhook endpoint is ready"
+  });
+});
+
+/**
+ * Process Paystack Events
  */
 async function processPaystackEvent(event, supabase, bot, paystackService) {
   const type = event.event;
@@ -141,23 +151,24 @@ async function processPaystackEvent(event, supabase, bot, paystackService) {
   console.log("📦 Processing Event:", type);
 
   switch (type) {
-    case "charge.success": // card or dedicated nuban funding
+    case "charge.success":
       await handleWalletFunding(data, supabase, bot, paystackService);
       break;
 
-    case "transfer.success": // transfer confirmation
+    case "transfer.success":
       await handleTransferSuccess(data, supabase, bot);
       break;
 
-    case "transfer.failed": // failed payout
+    case "transfer.failed":
       await handleTransferFailure(data, supabase, bot);
       break;
 
     case "dedicatedaccount.assign.success":
-      console.log("✅ Virtual account assigned successfully:", data);
+      console.log("✅ Virtual account assigned:", data.dedicated_account?.account_number);
       await logSecurityEvent(supabase, null, "VIRTUAL_ACCOUNT_ASSIGNED", {
         customer_code: data.customer?.customer_code,
-        account_number: data.dedicated_account?.account_number
+        account_number: data.dedicated_account?.account_number,
+        bank: data.dedicated_account?.bank?.name
       });
       break;
 
@@ -169,148 +180,120 @@ async function processPaystackEvent(event, supabase, bot, paystackService) {
       });
       break;
 
+    case "charge.dispute.create":
+      console.log("⚠️ Dispute created:", data.reference);
+      await logSecurityEvent(supabase, null, "DISPUTE_CREATED", {
+        reference: data.reference,
+        amount: data.amount / 100,
+        reason: data.reason
+      });
+      break;
+
+    case "charge.dispute.resolve":
+      console.log("✅ Dispute resolved:", data.reference);
+      await logSecurityEvent(supabase, null, "DISPUTE_RESOLVED", {
+        reference: data.reference,
+        resolution: data.resolution
+      });
+      break;
+
     default:
       console.log("ℹ️ Unhandled event type:", type);
       await logSecurityEvent(supabase, null, "UNHANDLED_WEBHOOK_EVENT", {
-        event_type: type
+        event_type: type,
+        data: data
       });
   }
 }
 
 /**
- * Handle wallet funding (charge.success or transfer to NUBAN)
+ * Telegram notification with retry
+ */
+async function sendTelegramWithRetry(bot, chatId, message, options = {}, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await bot.sendMessage(chatId, message, options);
+    } catch (err) {
+      if (err.response?.statusCode === 429) {
+        const retryAfter = err.response.parameters?.retry_after || (i + 1) * 2;
+        console.log(`⏳ Rate limited, retrying after ${retryAfter}s...`);
+        await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+      } else if (i === retries - 1) {
+        console.error("❌ Telegram notification failed:", err.message);
+        return null;
+      } else {
+        await new Promise(resolve => setTimeout(resolve, Math.pow(2, i) * 1000));
+      }
+    }
+  }
+}
+
+/**
+ * Handle wallet funding
  */
 async function handleWalletFunding(eventData, supabase, bot, paystackService) {
   const startTime = Date.now();
 
-  let amount, reference, customerCode, senderDetails;
-
   try {
-    // ✅ Parse data safely
-    if (eventData.customer?.customer_code) {
-      customerCode = eventData.customer.customer_code;
-      amount = eventData.amount / 100;
-      reference = eventData.reference;
-      senderDetails = {
-        name:
-          eventData.metadata?.sender_name ||
-          eventData.metadata?.account_name ||
-          eventData.customer?.email ||
-          "Bank Transfer",
-        bank: eventData.metadata?.sender_bank || "External Bank",
-      };
-    } else {
-      console.error("❌ Invalid event structure, missing customer_code");
-      await logSecurityEvent(supabase, null, "INVALID_WEBHOOK_STRUCTURE", {
-        event_data: eventData
-      });
+    const customerCode = eventData.customer?.customer_code;
+    const amount = eventData.amount / 100;
+    const reference = eventData.reference;
+    
+    if (!customerCode || !reference) {
+      console.error("❌ Missing required fields");
       return;
     }
 
-    // ✅ Sanitize reference
-    if (!/^[a-zA-Z0-9_-]{6,40}$/.test(reference)) {
-      console.error("❌ Invalid reference format:", reference);
-      await logSecurityEvent(supabase, null, "INVALID_REFERENCE_FORMAT", {
-        reference
-      });
-      return;
-    }
+    console.log(`💵 Funding: ₦${amount.toLocaleString()} | Ref: ${reference}`);
 
-    console.log(`💵 Funding Txn: ₦${amount.toLocaleString()} | Ref: ${reference}`);
-
-    // ✅ CRITICAL: Prevent duplicate processing with idempotency check
+    // Check for duplicates
     const { data: existing } = await supabase
       .from("transactions")
-      .select("id, status, created_at")
+      .select("id, status")
       .eq("reference", reference)
       .maybeSingle();
 
     if (existing) {
-      console.log("⚠️ Duplicate transaction ignored:", reference, "| Created:", existing.created_at);
-      await logSecurityEvent(supabase, null, "DUPLICATE_TRANSACTION_PREVENTED", {
-        reference,
-        existing_transaction_id: existing.id,
-        existing_status: existing.status
-      });
+      console.log("⚠️ Duplicate transaction ignored:", reference);
       return;
     }
 
-    // ✅ Verify with Paystack API
-    let verified;
-    try {
-      verified = await paystackService.verifyAndGetTransactionDetails(reference);
-      if (verified.status !== "success") {
-        console.error("❌ Paystack verification failed:", verified.status);
-        await logFailedFunding(supabase, {
-          customer_code: customerCode,
-          amount,
-          reference,
-          reason: `Paystack verification failed: ${verified.status}`,
-          verification_response: verified
-        });
-        return;
-      }
-
-      // ✅ Amount verification with tolerance for rounding
-      const verifiedAmount = verified.amount / 100;
-      if (Math.abs(verifiedAmount - amount) > 0.01) {
-        console.warn(`⚠️ Amount mismatch — Webhook: ₦${amount}, Verified: ₦${verifiedAmount}`);
-        amount = verifiedAmount; // Use verified amount
-      }
-    } catch (err) {
-      console.error("❌ Paystack verification error:", err.message);
-      await logFailedFunding(supabase, {
-        customer_code: customerCode,
-        amount,
-        reference,
-        reason: "Paystack API verification failed",
-        error: err.message
-      });
+    // Verify with Paystack
+    const verified = await paystackService.verifyAndGetTransactionDetails(reference);
+    if (verified.status !== "success") {
+      console.error("❌ Verification failed:", verified.status);
       return;
     }
 
-    // ✅ Find user
-    const { data: user, error: userError } = await supabase
+    // Find user
+    const { data: user } = await supabase
       .from("users")
       .select("*")
       .eq("paystack_customer_code", customerCode)
       .single();
 
-    if (userError || !user) {
-      console.error("❌ No user found for customer code:", customerCode);
-      await logFailedFunding(supabase, {
-        customer_code: customerCode,
-        amount,
-        reference,
-        reason: "User not found in database",
-        error: userError?.message
-      });
+    if (!user) {
+      console.error("❌ User not found for:", customerCode);
       return;
     }
 
-    // ✅ Atomic wallet update using Postgres RPC with idempotency
-    const { data: rpcResult, error: rpcError } = await supabase.rpc("process_wallet_funding", {
+    // Update wallet atomically
+    const { error: rpcError } = await supabase.rpc("process_wallet_funding", {
       uid: user.id,
       amt: amount,
       ref: reference,
-      p_desc: `Wallet funding from ${senderDetails.name}`,
+      p_desc: `Wallet funding`,
     });
 
     if (rpcError) {
-      console.error("❌ RPC error during wallet funding:", rpcError);
-      
-      // Check if it's a duplicate constraint error
-      if (rpcError.code === '23505') { // Unique violation
-        console.log("⚠️ Duplicate prevented by database constraint:", reference);
+      if (rpcError.code === '23505') {
+        console.log("⚠️ Duplicate prevented by DB");
         return;
       }
-      
       throw rpcError;
     }
 
-    console.log(`✅ Wallet funded for user: ${user.id}`);
-
-    // ✅ Get new balance
+    // Get new balance
     const { data: refreshed } = await supabase
       .from("users")
       .select("wallet_balance")
@@ -319,17 +302,15 @@ async function handleWalletFunding(eventData, supabase, bot, paystackService) {
 
     const newBalance = parseFloat(refreshed.wallet_balance);
 
-    // ✅ Notify user via Telegram with retry logic
+    // Notify user
     if (user.telegram_chat_id) {
       await sendTelegramWithRetry(
         bot,
         user.telegram_chat_id,
         `💸 *Payment Received!*\n\n` +
-        `💰 *Amount:* ₦${amount.toLocaleString()}\n` +
-        `💵 *New Balance:* ₦${newBalance.toLocaleString()}\n` +
-        `👤 *From:* ${senderDetails.name}\n` +
-        `🏦 *Bank:* ${senderDetails.bank}\n` +
-        `🔖 *Ref:* \`${reference}\`\n\n` +
+        `💰 Amount: ₦${amount.toLocaleString()}\n` +
+        `💵 New Balance: ₦${newBalance.toLocaleString()}\n` +
+        `🔖 Ref: \`${reference}\`\n\n` +
         `🎉 Your wallet has been credited!`,
         { parse_mode: "Markdown" }
       );
@@ -338,34 +319,19 @@ async function handleWalletFunding(eventData, supabase, bot, paystackService) {
     await logSecurityEvent(supabase, user.id, "WALLET_FUNDED", {
       amount,
       reference,
-      verified: true,
-      sender: senderDetails.name,
-      sender_bank: senderDetails.bank,
       new_balance: newBalance,
-      processing_time_ms: Date.now() - startTime,
-      verification_status: verified.status
+      processing_time_ms: Date.now() - startTime
     });
 
-    console.log(
-      `✅ Wallet funding complete: ₦${amount.toLocaleString()} (${Date.now() - startTime}ms)`
-    );
+    console.log(`✅ Funding complete: ₦${amount.toLocaleString()}`);
+
   } catch (error) {
-    console.error("❌ Wallet funding error:", error.message);
-    console.error("Stack trace:", error.stack);
-    
-    await logFailedFunding(supabase, {
-      customer_code: customerCode,
-      amount,
-      reference,
-      reason: "Wallet funding processing failed",
-      error: error.message,
-      stack: error.stack
-    });
+    console.error("❌ Wallet funding error:", error);
   }
 }
 
 /**
- * Handle successful transfer notifications
+ * Handle transfer success
  */
 async function handleTransferSuccess(eventData, supabase, bot) {
   try {
@@ -380,44 +346,27 @@ async function handleTransferSuccess(eventData, supabase, bot) {
         bot,
         tx.users.telegram_chat_id,
         `✅ *Transfer Successful!*\n\n` +
-        `🔖 Ref: ${eventData.reference}\n` +
         `💰 Amount: ₦${(eventData.amount / 100).toLocaleString()}\n` +
-        `👤 Recipient: ${eventData.recipient?.name || tx.recipient_name || "Beneficiary"}\n` +
-        `📱 Account: ${eventData.recipient?.details?.account_number || tx.recipient_account}\n\n` +
-        `🎉 Transaction completed successfully.`,
+        `🔖 Ref: ${eventData.reference}\n\n` +
+        `🎉 Transaction completed.`,
         { parse_mode: "Markdown" }
       );
       
-      // Update transaction status
       await supabase
         .from("transactions")
-        .update({
+        .update({ 
           status: "completed",
-          metadata: {
-            ...tx.metadata,
-            paystack_confirmation: eventData,
-            confirmed_at: new Date().toISOString()
-          }
+          metadata: { paystack_confirmation: eventData }
         })
         .eq("id", tx.id);
     }
-    
-    await logSecurityEvent(supabase, tx?.user_id, "TRANSFER_SUCCESS", {
-      reference: eventData.reference,
-      amount: eventData.amount / 100
-    });
-    
   } catch (err) {
-    console.error("❌ Transfer success handling error:", err.message);
-    await logSecurityEvent(supabase, null, "TRANSFER_SUCCESS_HANDLER_ERROR", {
-      error: err.message,
-      reference: eventData.reference
-    });
+    console.error("❌ Transfer success error:", err);
   }
 }
 
 /**
- * Handle transfer failures
+ * Handle transfer failure
  */
 async function handleTransferFailure(eventData, supabase, bot) {
   try {
@@ -430,7 +379,6 @@ async function handleTransferFailure(eventData, supabase, bot) {
     if (tx) {
       const refundAmount = parseFloat(tx.amount) + parseFloat(tx.service_fee || 0);
       
-      // ✅ Refund to wallet atomically
       const { data: user } = await supabase
         .from("users")
         .select("wallet_balance")
@@ -444,18 +392,15 @@ async function handleTransferFailure(eventData, supabase, bot) {
         .update({ wallet_balance: newBalance })
         .eq("id", tx.users.id);
 
-      // Update transaction status
       await supabase
         .from("transactions")
         .update({
           status: "failed",
           metadata: {
-            ...tx.metadata,
-            failure_reason: eventData.reason || "Transfer failed",
-            failed_at: new Date().toISOString(),
+            failure_reason: eventData.reason,
             refunded: true,
             refund_amount: refundAmount
-          },
+          }
         })
         .eq("id", tx.id);
 
@@ -464,74 +409,35 @@ async function handleTransferFailure(eventData, supabase, bot) {
           bot,
           tx.users.telegram_chat_id,
           `❌ *Transfer Failed*\n\n` +
-          `🔖 Ref: ${eventData.reference}\n` +
           `💰 Amount: ₦${parseFloat(tx.amount).toLocaleString()}\n` +
-          `❗ Reason: ${eventData.reason || "Unknown error"}\n\n` +
+          `❗ Reason: ${eventData.reason || "Unknown"}\n` +
           `💵 Refunded: ₦${refundAmount.toLocaleString()}\n` +
-          `📊 New Balance: ₦${newBalance.toLocaleString()}\n\n` +
-          `💡 Your funds have been returned to your wallet.\n` +
-          `Contact support if you need help.`,
+          `📊 New Balance: ₦${newBalance.toLocaleString()}`,
           { parse_mode: "Markdown" }
         );
       }
-      
-      await logSecurityEvent(supabase, tx.users.id, "TRANSFER_FAILED_REFUNDED", {
-        reference: eventData.reference,
-        amount: parseFloat(tx.amount),
-        refund_amount: refundAmount,
-        reason: eventData.reason,
-        new_balance: newBalance
-      });
     }
   } catch (error) {
-    console.error("❌ Transfer failure handling error:", error);
-    await logSecurityEvent(supabase, null, "TRANSFER_FAILURE_HANDLER_ERROR", {
-      error: error.message,
-      reference: eventData.reference
-    });
+    console.error("❌ Transfer failure error:", error);
   }
 }
 
 /**
- * Log failed funding attempts
- */
-async function logFailedFunding(supabase, details) {
-  try {
-    await supabase.from("failed_fundings").insert([
-      {
-        user_id: details.user_id || null,
-        customer_code: details.customer_code,
-        amount: details.amount,
-        reference: details.reference,
-        reason: details.reason,
-        error_details: details,
-        created_at: new Date().toISOString(),
-      },
-    ]);
-    console.log("📝 Failed funding logged:", details.reference);
-  } catch (error) {
-    console.error("❌ Failed funding logging error:", error);
-  }
-}
-
-/**
- * Log security or audit events
+ * Log security events
  */
 async function logSecurityEvent(supabase, userId, eventType, details) {
   try {
-    await supabase.from("security_logs").insert([
-      {
-        user_id: userId,
-        event_type: eventType,
-        details,
-        ip_address: "webhook",
-        user_agent: "paystack_webhook",
-        created_at: new Date().toISOString(),
-      },
-    ]);
+    await supabase.from("security_logs").insert([{
+      user_id: userId,
+      event_type: eventType,
+      details,
+      ip_address: "webhook",
+      user_agent: "paystack_webhook",
+      created_at: new Date().toISOString()
+    }]);
   } catch (error) {
     console.error("❌ Security logging error:", error);
   }
 }
 
-export default handlePaystackWebhook;
+export default app;
