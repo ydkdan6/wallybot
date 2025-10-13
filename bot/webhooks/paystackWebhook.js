@@ -133,7 +133,7 @@ app.post("/webhooks/paystack", async (req, res) => {
 /**
  * Health check endpoint
  */
-app.get("/webhooks/paystack", (req, res) => {
+app.post("/webhooks/paystack", (req, res) => {
   res.status(200).json({ 
     status: "active",
     webhook_url: "https://quickwally.onrender.com/webhooks/paystack",
