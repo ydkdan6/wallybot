@@ -2,7 +2,7 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
-import { handlePaystackWebhook } from './webhooks/paystackWebhook.js';
+// import { handlePaystackWebhook } from './webhooks/paystackWebhook.js';
 import TelegramBot from 'node-telegram-bot-api';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createClient } from '@supabase/supabase-js';
@@ -104,9 +104,9 @@ app.use('/paystack/webhook', async (req, res, next) => {
 });
 
 // Production Paystack webhook endpoint with full verification
-app.post('/paystack/webhook', async (req, res) => {
-  await handlePaystackWebhook(req, res, supabase, bot, paystackService);
-});
+// app.post('/paystack/webhook', async (req, res) => {
+//   await handlePaystackWebhook(req, res, supabase, bot, paystackService);
+// });
 
 // ============= WEBHOOK MONITORING & MANAGEMENT ENDPOINTS =============
 
@@ -507,7 +507,7 @@ app.post('/paystack/replay-webhook/:eventId', async (req, res) => {
     };
 
     // Process the webhook (without signature verification for replay)
-    await handlePaystackWebhook(mockReq, mockRes, supabase, bot, paystackService);
+    // await handlePaystackWebhook(mockReq, mockRes, supabase, bot, paystackService);
 
     res.json({
       success: true,
@@ -544,7 +544,7 @@ app.post('/paystack/webhook/test', async (req, res) => {
 
     // Process through the main webhook handler
     const mockReq = { body: testEvent, headers: {} };
-    await handlePaystackWebhook(mockReq, res, supabase, bot, paystackService);
+    // await handlePaystackWebhook(mockReq, res, supabase, bot, paystackService);
     
   } catch (error) {
     res.status(500).json({ 
