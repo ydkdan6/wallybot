@@ -2,26 +2,22 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
-// import { handlePaystackWebhook } from './webhooks/paystackWebhook.js';
 import TelegramBot from 'node-telegram-bot-api';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createClient } from '@supabase/supabase-js';
-import axios from 'axios';
 import bcrypt from 'bcryptjs';
 import cron from 'node-cron';
 import crypto from 'crypto';
-import { v4 as uuidv4 } from 'uuid';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import express from 'express';
-import bodyParser from 'body-parser';
 
 // Get __dirname equivalent for ES modules
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Services - Enhanced workflow services
+// Services
 import PaystackService from './services/PaystackService.js';
 import ReceiptService from './services/ReceiptService.js';
 import ReportService from './services/ReportService.js';
@@ -29,6 +25,7 @@ import OCRService from './services/OCRService.js';
 import EnhancedNLPService from './services/EnhancedNLPService.js';
 import EnhancedBeneficiaryService from './services/EnhancedBeneficiaryService.js';
 import WalletWorkflowService from './services/WalletWorkflowService.js';
+import PaystackWebhookHandler from './webhooks/paystackWebhook.js';
 
 // Validate environment variables
 const requiredEnvVars = [
@@ -53,67 +50,50 @@ const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// Initialize services in correct order (Paystack first, then OCR with Paystack dependency)
+// Initialize services in correct order
 const paystackService = new PaystackService(process.env.PAYSTACK_SECRET_KEY);
 const receiptService = new ReceiptService();
 const reportService = new ReportService(supabase);
-const ocrService = new OCRService(process.env.OCR_API_KEY, paystackService); // Pass paystackService
+const ocrService = new OCRService(process.env.OCR_API_KEY, paystackService);
 const nlpService = new EnhancedNLPService(genAI);
 const beneficiaryService = new EnhancedBeneficiaryService(paystackService, supabase);
 const workflowService = new WalletWorkflowService(nlpService, ocrService, paystackService, beneficiaryService);
 
 // ============= EXPRESS APP SETUP =============
 const app = express();
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
+
+// CRITICAL: Raw body parser for webhook MUST come before JSON parser
+app.use('/webhooks/paystack', express.raw({ type: 'application/json' }));
+
+// Standard JSON parser for other routes
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Make services available to webhook handler
+app.locals = { supabase, bot, paystackService };
 
 // Set port from environment or default
 const PORT = process.env.PORT || 3000;
 
 // Start Express server
 const server = app.listen(PORT, () => {
-  console.log(`🌐 Express server running on port ${PORT}`);
-  console.log(`📡 Webhook URL: http://localhost:${PORT}/paystack/webhook`);
+  console.log('🌐 Express server running on port', PORT);
+  console.log(`📡 Webhook URL: http://localhost:${PORT}/webhooks/paystack`);
+  console.log(`\n🔗 For local testing with ngrok:`);
+  console.log(`   1. Run: ngrok http ${PORT}`);
+  console.log(`   2. Copy the https URL (e.g., https://abc123.ngrok-free.app)`);
+  console.log(`   3. Use: https://YOUR-NGROK-URL.ngrok-free.app/webhooks/paystack`);
+  console.log(`   4. Add to Paystack Dashboard → Settings → Webhooks\n`);
 });
 
-// ============= ENHANCED PRODUCTION WEBHOOK HANDLER =============
+// ============= MOUNT WEBHOOK HANDLER =============
+app.use('', PaystackWebhookHandler);
 
-// Log all webhook events to database (middleware)
-app.use('/paystack/webhook', async (req, res, next) => {
+// ============= ADMIN MONITORING ENDPOINTS =============
+
+// Webhook statistics
+app.get('/admin/webhook/stats', async (req, res) => {
   try {
-    const eventData = req.body;
-    
-    await supabase
-      .from('webhook_events')
-      .insert([{
-        event_type: eventData.event,
-        reference: eventData.data?.reference,
-        customer_code: eventData.data?.customer?.customer_code || 
-                       eventData.data?.dedicated_account?.customer?.customer_code,
-        amount: eventData.data?.amount ? eventData.data.amount / 100 : null,
-        status: eventData.data?.status,
-        event_data: eventData,
-        processed: false,
-        created_at: new Date().toISOString()
-      }]);
-  } catch (error) {
-    console.error('Error logging webhook event:', error);
-  }
-  
-  next();
-});
-
-// Production Paystack webhook endpoint with full verification
-// app.post('/paystack/webhook', async (req, res) => {
-//   await handlePaystackWebhook(req, res, supabase, bot, paystackService);
-// });
-
-// ============= WEBHOOK MONITORING & MANAGEMENT ENDPOINTS =============
-
-// Get webhook statistics
-app.get('/paystack/webhook/stats', async (req, res) => {
-  try {
-    // Check for admin authorization (optional - comment out for development)
     if (process.env.ADMIN_SECRET_KEY) {
       const authHeader = req.headers.authorization;
       if (!authHeader || authHeader !== `Bearer ${process.env.ADMIN_SECRET_KEY}`) {
@@ -121,13 +101,11 @@ app.get('/paystack/webhook/stats', async (req, res) => {
       }
     }
 
-    // Get webhook event statistics
     const { data: webhookStats } = await supabase
       .from('webhook_events')
       .select('event_type, processed, created_at')
       .gte('created_at', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
 
-    // Get failed fundings
     const { data: failedFundings } = await supabase
       .from('failed_fundings')
       .select('*')
@@ -135,15 +113,6 @@ app.get('/paystack/webhook/stats', async (req, res) => {
       .order('created_at', { ascending: false })
       .limit(10);
 
-    // Get recent reconciliations
-    const { data: reconciliations } = await supabase
-      .from('balance_reconciliation')
-      .select('*')
-      .eq('reconciled', false)
-      .order('created_at', { ascending: false })
-      .limit(10);
-
-    // Calculate statistics
     const stats = {
       last_24_hours: {
         total_events: webhookStats?.length || 0,
@@ -154,14 +123,9 @@ app.get('/paystack/webhook/stats', async (req, res) => {
       failed_fundings: {
         count: failedFundings?.length || 0,
         items: failedFundings || []
-      },
-      unreconciled: {
-        count: reconciliations?.length || 0,
-        items: reconciliations || []
       }
     };
 
-    // Group by event type
     webhookStats?.forEach(event => {
       if (!stats.last_24_hours.event_types[event.event_type]) {
         stats.last_24_hours.event_types[event.event_type] = 0;
@@ -180,10 +144,9 @@ app.get('/paystack/webhook/stats', async (req, res) => {
   }
 });
 
-// Manual balance check endpoint
-app.post('/paystack/check-balance/:userId', async (req, res) => {
+// Manual balance check
+app.post('/admin/check-balance/:userId', async (req, res) => {
   try {
-    // Check for admin authorization (optional - comment out for development)
     if (process.env.ADMIN_SECRET_KEY) {
       const authHeader = req.headers.authorization;
       if (!authHeader || authHeader !== `Bearer ${process.env.ADMIN_SECRET_KEY}`) {
@@ -193,7 +156,6 @@ app.post('/paystack/check-balance/:userId', async (req, res) => {
 
     const { userId } = req.params;
 
-    // Get user
     const { data: user, error: userError } = await supabase
       .from('users')
       .select('*')
@@ -204,7 +166,6 @@ app.post('/paystack/check-balance/:userId', async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // Calculate balance from transactions
     const { data: transactions } = await supabase
       .from('transactions')
       .select('type, amount, service_fee, status')
@@ -231,15 +192,6 @@ app.post('/paystack/check-balance/:userId', async (req, res) => {
     const currentBalance = parseFloat(user.wallet_balance);
     const difference = currentBalance - calculatedBalance;
 
-    // Get Paystack balance
-    let paystackBalance = null;
-    try {
-      const balance = await paystackService.checkBalance();
-      paystackBalance = balance[0]?.balance / 100;
-    } catch (error) {
-      console.error('Paystack balance check failed:', error.message);
-    }
-
     res.json({
       success: true,
       user: {
@@ -254,7 +206,6 @@ app.post('/paystack/check-balance/:userId', async (req, res) => {
         is_balanced: Math.abs(difference) < 0.01
       },
       summary,
-      paystack_balance: paystackBalance,
       transaction_count: transactions?.length || 0
     });
   } catch (error) {
@@ -263,104 +214,9 @@ app.post('/paystack/check-balance/:userId', async (req, res) => {
   }
 });
 
-// Manually trigger balance reconciliation
-app.post('/paystack/reconcile/:userId', async (req, res) => {
-  try {
-    // Check for admin authorization (optional - comment out for development)
-    if (process.env.ADMIN_SECRET_KEY) {
-      const authHeader = req.headers.authorization;
-      if (!authHeader || authHeader !== `Bearer ${process.env.ADMIN_SECRET_KEY}`) {
-        return res.status(401).json({ error: 'Unauthorized' });
-      }
-    }
-
-    const { userId } = req.params;
-
-    // Use the reconcile function
-    const { data: result } = await supabase
-      .rpc('reconcile_user_balance', { p_user_id: userId });
-
-    if (result && result.length > 0) {
-      const reconciliation = result[0];
-      
-      // Log reconciliation
-      await supabase
-        .from('balance_reconciliation')
-        .insert([{
-          user_id: userId,
-          user_balance: reconciliation.current_balance,
-          reconciled: !reconciliation.needs_adjustment,
-          notes: `Manual reconciliation via API. Status: ${reconciliation.status}`,
-          created_at: new Date().toISOString()
-        }]);
-
-      res.json({
-        success: true,
-        reconciliation: {
-          status: reconciliation.status,
-          current_balance: parseFloat(reconciliation.current_balance),
-          calculated_balance: parseFloat(reconciliation.calculated_balance),
-          difference: parseFloat(reconciliation.difference),
-          needs_adjustment: reconciliation.needs_adjustment
-        }
-      });
-    } else {
-      res.status(404).json({ error: 'User not found' });
-    }
-  } catch (error) {
-    console.error('Reconciliation error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get platform balance summary
-app.get('/paystack/platform/summary', async (req, res) => {
-  try {
-    // Check for admin authorization (optional - comment out for development)
-    if (process.env.ADMIN_SECRET_KEY) {
-      const authHeader = req.headers.authorization;
-      if (!authHeader || authHeader !== `Bearer ${process.env.ADMIN_SECRET_KEY}`) {
-        return res.status(401).json({ error: 'Unauthorized' });
-      }
-    }
-
-    const { data: summary } = await supabase.rpc('get_balance_summary');
-
-    // Get Paystack integration balance
-    let paystackBalance = null;
-    try {
-      const balance = await paystackService.checkBalance();
-      paystackBalance = balance[0]?.balance / 100;
-    } catch (error) {
-      console.error('Paystack balance check failed:', error.message);
-    }
-
-    // Get users with balance issues
-    const { data: issues } = await supabase
-      .from('balance_verification_summary')
-      .select('*')
-      .eq('balance_verified', false);
-
-    res.json({
-      success: true,
-      timestamp: new Date().toISOString(),
-      summary: summary?.[0] || {},
-      paystack_balance: paystackBalance,
-      balance_issues: {
-        count: issues?.length || 0,
-        users: issues || []
-      }
-    });
-  } catch (error) {
-    console.error('Platform summary error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
 // Retry failed funding
-app.post('/paystack/retry-funding/:failedFundingId', async (req, res) => {
+app.post('/admin/retry-funding/:failedFundingId', async (req, res) => {
   try {
-    // Check for admin authorization (optional - comment out for development)
     if (process.env.ADMIN_SECRET_KEY) {
       const authHeader = req.headers.authorization;
       if (!authHeader || authHeader !== `Bearer ${process.env.ADMIN_SECRET_KEY}`) {
@@ -370,7 +226,6 @@ app.post('/paystack/retry-funding/:failedFundingId', async (req, res) => {
 
     const { failedFundingId } = req.params;
 
-    // Get failed funding record
     const { data: failedFunding, error: fetchError } = await supabase
       .from('failed_fundings')
       .select('*')
@@ -385,7 +240,6 @@ app.post('/paystack/retry-funding/:failedFundingId', async (req, res) => {
       return res.status(400).json({ error: 'This funding has already been resolved' });
     }
 
-    // Verify transaction with Paystack
     let verified = false;
     try {
       const txnDetails = await paystackService.verifyAndGetTransactionDetails(
@@ -395,7 +249,6 @@ app.post('/paystack/retry-funding/:failedFundingId', async (req, res) => {
       if (txnDetails.status === 'success') {
         verified = true;
         
-        // Process the funding
         const { data: user } = await supabase
           .from('users')
           .select('*')
@@ -406,13 +259,11 @@ app.post('/paystack/retry-funding/:failedFundingId', async (req, res) => {
           const currentBalance = parseFloat(user.wallet_balance || 0);
           const newBalance = currentBalance + failedFunding.amount;
 
-          // Update balance
           await supabase
             .from('users')
             .update({ wallet_balance: newBalance })
             .eq('id', user.id);
 
-          // Create transaction record
           await supabase
             .from('transactions')
             .insert([{
@@ -426,7 +277,6 @@ app.post('/paystack/retry-funding/:failedFundingId', async (req, res) => {
               created_at: new Date().toISOString()
             }]);
 
-          // Mark as resolved
           await supabase
             .from('failed_fundings')
             .update({
@@ -436,7 +286,6 @@ app.post('/paystack/retry-funding/:failedFundingId', async (req, res) => {
             })
             .eq('id', failedFundingId);
 
-          // Notify user
           if (user.telegram_chat_id) {
             await bot.sendMessage(
               user.telegram_chat_id,
@@ -467,122 +316,18 @@ app.post('/paystack/retry-funding/:failedFundingId', async (req, res) => {
   }
 });
 
-// Webhook event replay (for debugging)
-app.post('/paystack/replay-webhook/:eventId', async (req, res) => {
-  try {
-    // Check for admin authorization (optional - comment out for development)
-    if (process.env.ADMIN_SECRET_KEY) {
-      const authHeader = req.headers.authorization;
-      if (!authHeader || authHeader !== `Bearer ${process.env.ADMIN_SECRET_KEY}`) {
-        return res.status(401).json({ error: 'Unauthorized' });
-      }
-    }
+console.log('🔗 Admin endpoints configured:');
+console.log('   GET    /admin/webhook/stats - Webhook statistics');
+console.log('   POST   /admin/check-balance/:userId - Check user balance');
+console.log('   POST   /admin/retry-funding/:failedFundingId - Retry failed funding\n');
 
-    const { eventId } = req.params;
+// ============= SECURITY & SESSION MANAGEMENT =============
 
-    // Get webhook event
-    const { data: event, error: fetchError } = await supabase
-      .from('webhook_events')
-      .select('*')
-      .eq('id', eventId)
-      .single();
-
-    if (fetchError || !event) {
-      return res.status(404).json({ error: 'Webhook event not found' });
-    }
-
-    // Replay the event
-    const mockReq = {
-      body: event.event_data,
-      headers: {
-        'x-paystack-signature': 'REPLAY' // Mark as replay
-      }
-    };
-
-    const mockRes = {
-      status: (code) => ({
-        send: (msg) => console.log(`Replay response: ${code} - ${msg}`),
-        json: (data) => console.log('Replay response:', data)
-      })
-    };
-
-    // Process the webhook (without signature verification for replay)
-    // await handlePaystackWebhook(mockReq, mockRes, supabase, bot, paystackService);
-
-    res.json({
-      success: true,
-      message: 'Webhook event replayed',
-      event_id: eventId
-    });
-  } catch (error) {
-    console.error('Replay webhook error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Webhook test endpoint for development
-app.post('/paystack/webhook/test', async (req, res) => {
-  try {
-    console.log('🧪 Test webhook received');
-    
-    // Sample test event data
-    const testEvent = {
-      event: 'charge.success',
-      data: {
-        amount: 1000000, // ₦10,000 in kobo
-        customer: {
-          customer_code: 'CUS_test123'
-        },
-        channel: 'dedicated_nuban',
-        reference: `TEST_${Date.now()}`,
-        metadata: {
-          sender_name: 'Test Sender',
-          sender_bank: 'Test Bank'
-        }
-      }
-    };
-
-    // Process through the main webhook handler
-    const mockReq = { body: testEvent, headers: {} };
-    // await handlePaystackWebhook(mockReq, res, supabase, bot, paystackService);
-    
-  } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
-    });
-  }
-});
-
-// Webhook health check
-app.get('/paystack/webhook/health', (req, res) => {
-  res.json({
-    status: 'healthy',
-    webhook_url: `${req.protocol}://${req.get('host')}/paystack/webhook`,
-    timestamp: new Date().toISOString(),
-    paystack_configured: !!process.env.PAYSTACK_SECRET_KEY,
-    admin_endpoints_secured: !!process.env.ADMIN_SECRET_KEY
-  });
-});
-
-console.log('🔗 Enhanced Webhook endpoints configured:');
-console.log('   POST   /paystack/webhook - Production webhook');
-console.log('   GET    /paystack/webhook/stats - Webhook statistics (Admin)');
-console.log('   GET    /paystack/webhook/health - Health check');
-console.log('   POST   /paystack/webhook/test - Test webhook');
-console.log('   POST   /paystack/check-balance/:userId - Check user balance (Admin)');
-console.log('   POST   /paystack/reconcile/:userId - Reconcile user balance (Admin)');
-console.log('   GET    /paystack/platform/summary - Platform summary (Admin)');
-console.log('   POST   /paystack/retry-funding/:failedFundingId - Retry failed funding (Admin)');
-console.log('   POST   /paystack/replay-webhook/:eventId - Replay webhook event (Admin)');
-
-// Rate limiting and security
 const rateLimiter = new Map();
 const failedAttempts = new Map();
 const userSessions = new Map();
 const conversationContext = new Map();
 
-// Security configuration
 const SECURITY_CONFIG = {
   MAX_REQUESTS_PER_MINUTE: 20,
   MAX_FAILED_ATTEMPTS: 5,
@@ -595,7 +340,6 @@ const SECURITY_CONFIG = {
   SESSION_TIMEOUT: 5 * 60 * 1000
 };
 
-// Rate limiting middleware
 function checkRateLimit(userId) {
   const now = Date.now();
   const userLimit = rateLimiter.get(userId) || { requests: [], lastReset: now };
@@ -616,33 +360,25 @@ function checkRateLimit(userId) {
   return true;
 }
 
-// Check if user is locked out
 function isUserLockedOut(userId) {
   const attempts = failedAttempts.get(userId);
   if (!attempts) return false;
-  
-  return attempts.count >= SECURITY_CONFIG.MAX_FAILED_ATTEMPTS && 
-         Date.now() < attempts.lockUntil;
+  return attempts.count >= SECURITY_CONFIG.MAX_FAILED_ATTEMPTS && Date.now() < attempts.lockUntil;
 }
 
-// Record failed attempt
 function recordFailedAttempt(userId) {
   const attempts = failedAttempts.get(userId) || { count: 0, lockUntil: 0 };
   attempts.count++;
-  
   if (attempts.count >= SECURITY_CONFIG.MAX_FAILED_ATTEMPTS) {
     attempts.lockUntil = Date.now() + SECURITY_CONFIG.LOCKOUT_DURATION;
   }
-  
   failedAttempts.set(userId, attempts);
 }
 
-// Clear failed attempts on success
 function clearFailedAttempts(userId) {
   failedAttempts.delete(userId);
 }
 
-// Check transaction limits
 async function checkTransactionLimits(userId, amount) {
   try {
     const today = new Date();
@@ -673,14 +409,12 @@ async function checkTransactionLimits(userId, amount) {
     }
     
     return { allowed: true };
-    
   } catch (error) {
     console.error('Transaction limit check error:', error);
     return { allowed: false, reason: 'Unable to verify transaction limits' };
   }
 }
 
-// Clean up expired sessions
 function cleanupSessions() {
   const now = Date.now();
   for (const [chatId, session] of userSessions.entries()) {
@@ -696,6 +430,8 @@ function cleanupSessions() {
 }
 
 setInterval(cleanupSessions, 60000);
+
+// ============= TELEGRAM BOT HANDLERS =============
 
 // Welcome message
 bot.onText(/\/start(.*)/, async (msg, match) => {
@@ -1232,6 +968,137 @@ bot.on('photo', async (msg) => {
   }
 });
 
+// Help command
+bot.onText(/\/help/, async (msg) => {
+  const chatId = msg.chat.id;
+  
+  try {
+    if (!checkRateLimit(chatId.toString())) {
+      await bot.sendMessage(chatId, '⚠️ Too many requests. Please wait a minute.');
+      return;
+    }
+
+    await bot.sendMessage(chatId,
+      `🆘 QuickWallet Help\n\n` +
+      `💬 **Natural Language Commands:**\n` +
+      `Just talk to me naturally! I understand:\n\n` +
+      
+      `💰 **Wallet Funding:**\n` +
+      `• "Fund my wallet with 10000"\n` +
+      `• "I want to add money to my wallet"\n` +
+      `• "How do I fund my account?"\n\n` +
+      
+      `💸 **Send Money:**\n` +
+      `• "Send 5000 to 0123456789"\n` +
+      `• "Transfer 10000 to John" (saved contact)\n` +
+      `• "Pay my friend 2000"\n\n` +
+      
+      `👥 **Manage Beneficiaries:**\n` +
+      `• "Add my mom's account 0123456789 GTBank"\n` +
+      `• "Save this account as John"\n` +
+      `• "Show my saved contacts"\n` +
+      `• Send a bank statement photo to auto-add\n\n` +
+      
+      `📊 **Account Info:**\n` +
+      `• "Check my balance"\n` +
+      `• "Show transaction history"\n` +
+      `• "What's my account number?"\n\n` +
+      
+      `🔐 **Security Features:**\n` +
+      `• PIN protection for all transfers\n` +
+      `• Daily limit: ₦${SECURITY_CONFIG.TRANSACTION_LIMITS.DAILY_LIMIT.toLocaleString()}\n` +
+      `• Per transaction: ₦${SECURITY_CONFIG.TRANSACTION_LIMITS.SINGLE_TRANSACTION.toLocaleString()}\n` +
+      `• Account lockout after failed attempts\n\n` +
+      
+      `📱 **Other Commands:**\n` +
+      `/start - Link your account\n` +
+      `/help - Show this help message\n` +
+      `/banks - Show supported banks\n\n` +
+      
+      `❓ **Need Help?**\n` +
+      `Just ask me anything about your wallet!`);
+
+  } catch (error) {
+    console.error('Help command error:', error);
+    await bot.sendMessage(chatId, '❌ Error displaying help. Please try again.');
+  }
+});
+
+// Show supported banks
+bot.onText(/\/banks/, async (msg) => {
+  const chatId = msg.chat.id;
+  
+  try {
+    const banks = ocrService.getSupportedBanks();
+    const bankList = banks
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map(bank => `• ${bank.name}`)
+      .join('\n');
+    
+    await bot.sendMessage(chatId, 
+      `🏦 *Supported Banks* (${banks.length})\n\n${bankList}\n\n` +
+      `💡 You can send money to any of these banks!`,
+      { parse_mode: 'Markdown' });
+  } catch (error) {
+    console.error('Banks command error:', error);
+    await bot.sendMessage(chatId, '❌ Unable to retrieve bank list.');
+  }
+});
+
+// Test bank command (for debugging)
+bot.onText(/\/test_bank (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const bankName = match[1];
+  
+  try {
+    const result = await beneficiaryService.testBankResolution(bankName);
+    if (result) {
+      await bot.sendMessage(chatId, `✅ Found: ${result.name} (Code: ${result.code})`);
+    } else {
+      await bot.sendMessage(chatId, `❌ Could not find: "${bankName}"`);
+    }
+  } catch (error) {
+    await bot.sendMessage(chatId, '❌ Error testing bank resolution.');
+  }
+});
+
+// Admin stats command
+bot.onText(/\/admin_stats/, async (msg) => {
+  const chatId = msg.chat.id;
+  
+  try {
+    const { data: user } = await supabase
+      .from('users')
+      .select('role')
+      .eq('telegram_chat_id', chatId.toString())
+      .single();
+
+    if (!user || user.role !== 'admin') {
+      await bot.sendMessage(chatId, '❌ Unauthorized access.');
+      return;
+    }
+
+    const stats = {
+      activeUsers: rateLimiter.size,
+      activeSessions: userSessions.size,
+      conversationContexts: conversationContext.size,
+      lockedUsers: Array.from(failedAttempts.values()).filter(a => Date.now() < a.lockUntil).length
+    };
+
+    await bot.sendMessage(chatId, 
+      `📊 System Statistics\n\n` +
+      `👥 Active Users: ${stats.activeUsers}\n` +
+      `🔄 Active Sessions: ${stats.activeSessions}\n` +
+      `💬 Conversation Contexts: ${stats.conversationContexts}\n` +
+      `🔒 Locked Users: ${stats.lockedUsers}\n` +
+      `⏰ Uptime: ${Math.floor(process.uptime())} seconds`);
+
+  } catch (error) {
+    console.error('Admin stats error:', error);
+    await bot.sendMessage(chatId, '❌ Error retrieving statistics.');
+  }
+});
+
 // Monthly report generation
 cron.schedule('0 0 28-31 * *', async () => {
   const today = new Date();
@@ -1239,7 +1106,7 @@ cron.schedule('0 0 28-31 * *', async () => {
   tomorrow.setDate(tomorrow.getDate() + 1);
   
   if (tomorrow.getDate() === 1) {
-    console.log('Generating monthly reports...');
+    console.log('📊 Generating monthly reports...');
     await generateMonthlyReports();
   }
 });
@@ -1305,145 +1172,9 @@ bot.on('error', (error) => {
   }
 });
 
-// Admin stats command
-bot.onText(/\/admin_stats/, async (msg) => {
-  const chatId = msg.chat.id;
-  
-  try {
-    const { data: user } = await supabase
-      .from('users')
-      .select('role')
-      .eq('telegram_chat_id', chatId.toString())
-      .single();
-
-    if (!user || user.role !== 'admin') {
-      await bot.sendMessage(chatId, '❌ Unauthorized access.');
-      return;
-    }
-
-    const stats = {
-      activeUsers: rateLimiter.size,
-      activeSessions: userSessions.size,
-      conversationContexts: conversationContext.size,
-      lockedUsers: Array.from(failedAttempts.values()).filter(a => Date.now() < a.lockUntil).length
-    };
-
-    await bot.sendMessage(chatId, 
-      `📊 System Statistics\n\n` +
-      `👥 Active Users: ${stats.activeUsers}\n` +
-      `🔄 Active Sessions: ${stats.activeSessions}\n` +
-      `💬 Conversation Contexts: ${stats.conversationContexts}\n` +
-      `🔒 Locked Users: ${stats.lockedUsers}\n` +
-      `⏰ Uptime: ${Math.floor(process.uptime())} seconds`);
-
-  } catch (error) {
-    console.error('Admin stats error:', error);
-    await bot.sendMessage(chatId, '❌ Error retrieving statistics.');
-  }
-});
-
-// Help command
-bot.onText(/\/help/, async (msg) => {
-  const chatId = msg.chat.id;
-  
-  try {
-    if (!checkRateLimit(chatId.toString())) {
-      await bot.sendMessage(chatId, '⚠️ Too many requests. Please wait a minute.');
-      return;
-    }
-
-    await bot.sendMessage(chatId,
-      `🆘 QuickWallet Help\n\n` +
-      `💬 **Natural Language Commands:**\n` +
-      `Just talk to me naturally! I understand:\n\n` +
-      
-      `💰 **Wallet Funding:**\n` +
-      `• "Fund my wallet with 10000"\n` +
-      `• "I want to add money to my wallet"\n` +
-      `• "How do I fund my account?"\n\n` +
-      
-      `💸 **Send Money:**\n` +
-      `• "Send 5000 to 0123456789"\n` +
-      `• "Transfer 10000 to John" (saved contact)\n` +
-      `• "Pay my friend 2000"\n\n` +
-      
-      `👥 **Manage Beneficiaries:**\n` +
-      `• "Add my mom's account 0123456789 GTBank"\n` +
-      `• "Save this account as John"\n` +
-      `• "Show my saved contacts"\n` +
-      `• Send a bank statement photo to auto-add\n\n` +
-      
-      `📊 **Account Info:**\n` +
-      `• "Check my balance"\n` +
-      `• "Show transaction history"\n` +
-      `• "What's my account number?"\n\n` +
-      
-      `🔐 **Security Features:**\n` +
-      `• PIN protection for all transfers\n` +
-      `• Daily limit: ₦${SECURITY_CONFIG.TRANSACTION_LIMITS.DAILY_LIMIT.toLocaleString()}\n` +
-      `• Per transaction: ₦${SECURITY_CONFIG.TRANSACTION_LIMITS.SINGLE_TRANSACTION.toLocaleString()}\n` +
-      `• Account lockout after failed attempts\n\n` +
-      
-      `📱 **Other Commands:**\n` +
-      `/start - Link your account\n` +
-      `/help - Show this help message\n\n` +
-      
-      `❓ **Need Help?**\n` +
-      `Just ask me anything about your wallet!`);
-
-  } catch (error) {
-    console.error('Help command error:', error);
-    await bot.sendMessage(chatId, '❌ Error displaying help. Please try again.');
-  }
-});
-
-// Test bank command
-bot.onText(/\/test_bank (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const bankName = match[1];
-  
-  const result = await beneficiaryService.testBankResolution(bankName);
-  if (result) {
-    await bot.sendMessage(chatId, `✅ Found: ${result.name} (Code: ${result.code})`);
-  } else {
-    await bot.sendMessage(chatId, `❌ Could not find: "${bankName}"`);
-  }
-});
-
-// Test OCR service
-bot.onText(/\/test_ocr/, async (msg) => {
-  const chatId = msg.chat.id;
-  
-  await bot.sendMessage(chatId, 
-    `🧪 OCR Test Mode\n\n` +
-    `Send me an image of a bank statement or account details to test OCR extraction.\n\n` +
-    `The image should contain:\n` +
-    `• Account number (10 digits)\n` +
-    `• Bank name\n` +
-    `• Account name (optional)\n` +
-    `• Amount (optional)\n\n` +
-    `I'll show you what I can extract!`);
-});
-
-// Show supported banks
-bot.onText(/\/banks/, async (msg) => {
-  const chatId = msg.chat.id;
-  
-  const banks = ocrService.getSupportedBanks();
-  const bankList = banks
-    .sort((a, b) => a.name.localeCompare(b.name))
-    .map(bank => `• ${bank.name}`)
-    .join('\n');
-  
-  await bot.sendMessage(chatId, 
-    `🏦 *Supported Banks* (${banks.length})\n\n${bankList}\n\n` +
-    `💡 You can send money to any of these banks!`,
-    { parse_mode: 'Markdown' });
-});
-
 // Graceful shutdown
 process.on('SIGINT', () => {
-  console.log('🛑 Shutting down Telegram bot gracefully...');
+  console.log('\n🛑 Shutting down gracefully...');
   
   userSessions.clear();
   conversationContext.clear();
@@ -1454,16 +1185,16 @@ process.on('SIGINT', () => {
   
   server.close(() => {
     console.log('🌐 Express server closed');
+    process.exit(0);
   });
-  
-  process.exit(0);
 });
 
 // Health monitoring
 setInterval(() => {
   const memUsage = process.memoryUsage();
-  console.log(`💾 Memory Usage: RSS ${Math.round(memUsage.rss / 1024 / 1024)}MB, Heap ${Math.round(memUsage.heapUsed / 1024 / 1024)}MB`);
+  console.log(`💾 Memory: RSS ${Math.round(memUsage.rss / 1024 / 1024)}MB, Heap ${Math.round(memUsage.heapUsed / 1024 / 1024)}MB`);
   
+  // Cleanup old rate limit entries
   const now = Date.now();
   for (const [userId, userLimit] of rateLimiter.entries()) {
     if (now - userLimit.lastReset > 120000) {
@@ -1471,6 +1202,7 @@ setInterval(() => {
     }
   }
   
+  // Cleanup expired lockouts
   for (const [userId, attempts] of failedAttempts.entries()) {
     if (now > attempts.lockUntil && attempts.count >= SECURITY_CONFIG.MAX_FAILED_ATTEMPTS) {
       failedAttempts.delete(userId);
@@ -1478,7 +1210,7 @@ setInterval(() => {
   }
 }, 60000);
 
-console.log('🤖 Enhanced Telegram bot started successfully!');
+console.log('🤖 QuickWallet Bot started successfully!');
 console.log('🔐 Security features enabled:');
 console.log(`   • Rate limiting: ${SECURITY_CONFIG.MAX_REQUESTS_PER_MINUTE} requests/minute`);
 console.log(`   • Transaction limits: ₦${SECURITY_CONFIG.TRANSACTION_LIMITS.SINGLE_TRANSACTION.toLocaleString()}/transaction, ₦${SECURITY_CONFIG.TRANSACTION_LIMITS.DAILY_LIMIT.toLocaleString()}/day`);
@@ -1487,6 +1219,6 @@ console.log('✨ Enhanced features enabled:');
 console.log('   • Beneficiary management with OCR');
 console.log('   • Conversation context tracking');
 console.log('   • Workflow-based processing');
-console.log('   • Advanced webhook monitoring and reconciliation');
+console.log('   • Clean webhook integration\n');
 
 export { bot, supabase, workflowService, beneficiaryService };
